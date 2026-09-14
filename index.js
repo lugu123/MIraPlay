@@ -11515,7 +11515,7 @@ var HSHLS_SETTINGS_PAGE="<!DOCTYPE html>\n<html lang=\"zh-CN\">\n\n<head>\n    <
 //  4) 提供 /js 管理 API（list / upload / file / order / config / reload）
 //  5) 提供 /website/js 配置页面（配合 /website 首页菜单）
 // ============================================================================
-var HSJS_VERSION = "2.7.0";
+var HSJS_VERSION = "2.7.1";
 var HSJS_ROUTES = new Map();
 var HSJS_SOURCES = [];
 var HSJS_FILES = [];
@@ -11803,20 +11803,68 @@ function hsjsCheerioLoad(html) {
   return c.load(html);
 }
 
+// ============================================================================
+// ★★ 2026-09-14 修复（2.7.1）：请求头修正
+//   引擎自带 axios 实例的默认头是「浏览器正在导航页面」那一套：
+//     Sec-Fetch-Dest: document / Sec-Fetch-Mode: navigate / Sec-Fetch-Site: none /
+//     Sec-Fetch-User: ?1 / Upgrade-Insecure-Requests: 1
+//   不少站点（尤其带防护的 JSON 接口）会据此把接口请求判定成“页面跳转”，
+//   直接 302 回站点首页 / 返回网页 HTML ⇒ 本地猫源脚本拿不到 JSON
+//   （典型表现：首页分类能出来，列表/搜索/详情全空；而用 curl/浏览器请求同一 URL 却正常）。
+//   浏览器里 fetch/XHR 调接口用的是 Sec-Fetch-Dest: empty / Sec-Fetch-Mode: cors。
+//   这里给引擎 axios 实例装一个请求拦截器，把这三个头统一改成 empty / cors / cross-site：
+//     · 对「所有」走该实例的请求生效（本地猫源 + 引擎自身），所以最省事；
+//     · 单个请求想保留原始头：配置里传 { hsRawHeaders: true }（或 rawFetchHeaders: true）；
+//     · 拦截器只装一次（实例上打标记 __hsNavFix）。
+// ============================================================================
+function hsjsInstallHeaderFix(inst) {
+  try {
+    if (!inst) inst = (typeof oe === "function" || typeof oe === "object") ? oe : null;
+    if (!inst || !inst.interceptors || !inst.interceptors.request || inst.__hsNavFix) return inst;
+    inst.__hsNavFix = true;
+    var FIX = {
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "cross-site",
+      "Upgrade-Insecure-Requests": "0"
+    };
+    inst.interceptors.request.use(function (c) {
+      try {
+        if (!c || c.hsRawHeaders === true || c.rawFetchHeaders === true) return c;
+        var h = c.headers || (c.headers = {});
+        for (var name in FIX) {
+          if (!Object.prototype.hasOwnProperty.call(FIX, name)) continue;
+          try {
+            if (typeof h.set === "function") h.set(name, FIX[name]);
+            else h[name] = FIX[name];
+          } catch (e) { try { h[name] = FIX[name]; } catch (e2) { } }
+        }
+      } catch (e) { }
+      return c;
+    });
+    try { console.log("[hsjs] 已启用请求头修正：Sec-Fetch-Dest=empty / Sec-Fetch-Mode=cors（避免接口被当成页面跳转而 302）"); } catch (e) { }
+  } catch (e) { }
+  return inst;
+}
+
 function hsjsReqModule(axiosInst) {
   var inst = axiosInst;
+  hsjsInstallHeaderFix(inst);
   var mod = {
     default: inst,
     get: function () { return inst.get.apply(inst, arguments); },
     post: function () { return inst.post.apply(inst, arguments); },
     put: function () { return inst.put.apply(inst, arguments); },
+    patch: function () { return inst.patch.apply(inst, arguments); },
+    delete: function () { return inst.delete.apply(inst, arguments); },
+    head: function () { return inst.head.apply(inst, arguments); },
+    options: function () { return inst.options.apply(inst, arguments); },
     request: function () { return inst.request.apply(inst, arguments); },
-    create: function (cfg) { return inst.create ? inst.create(cfg) : inst; },
+    create: function (cfg) { var c = inst.create ? inst.create(cfg) : inst; return hsjsInstallHeaderFix(c); },
     getSharedAgents: function () { return inst && inst.defaults && inst.defaults.httpsAgent ? [inst.defaults.httpsAgent] : []; }
   };
   return mod;
 }
-
 function hsjsHomeCache() {
   var store = new Map();
   return {
@@ -14124,6 +14172,7 @@ async function hsJsPagePlugin(fastify, opts) {
 
 function hsJsRegisterApis(app) {
   try {
+    hsjsInstallHeaderFix();
     app.register(hsJsApiPlugin, { prefix: "/js", db: app.db, config: app.config });
     app.register(hsJsPagePlugin, { prefix: "/website", db: app.db, config: app.config });
     console.log("[hsjs] 本地猫源管理接口已注册：/js/* , 页面 /website/js");
