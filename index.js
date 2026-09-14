@@ -11608,13 +11608,13 @@ function hsjsApplyConfig(key, config) {
 
 
 
-// ---- 目录解析（与 cat 引擎保持一致：NODE_PATH/js，否则平台默认目录） ----
+// ---- 目录解析：NODE_PATH/hs，否则平台默认目录 ----
 function hsjsDir() {
   var fs = require("fs");
   var path = require("path");
   var dir;
   if (process.env.NODE_PATH) {
-    dir = path.resolve(process.env.NODE_PATH, "js");
+    dir = path.resolve(process.env.NODE_PATH, "hs");
   } else {
     var home = require("os").homedir();
     switch (process.platform) {
