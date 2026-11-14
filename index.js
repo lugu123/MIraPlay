@@ -2509,17 +2509,54 @@ function hshlsAllowed(id,u){var g=hshlsGate(id);if(!g)return false;try{return g.
 function hshlsAddHosts(id,hosts){var g=hshlsGate(id);if(g)(hosts||[]).forEach(function(h){if(h)g.hosts.add(String(h).toLowerCase())})}
 function hshlsBuffer(v){if(Buffer.isBuffer(v))return v;if(v instanceof ArrayBuffer)return Buffer.from(v);if(ArrayBuffer.isView(v))return Buffer.from(v.buffer,v.byteOffset,v.byteLength);return Buffer.from(v||"")}
 async function hshlsGet(url,headers,responseType,timeout){var base=Object.assign({"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept-Encoding":"identity"},headers||{});if(!base.Referer&&!base.referer){try{base.Referer=new URL(url).origin+"/";}catch(e){}}var UAS=[base["User-Agent"],"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"];var err=null;for(var i=0;i<UAS.length;i++){try{var hd=Object.assign({},base);if(UAS[i])hd["User-Agent"]=UAS[i];var r=await oe.get(url,{headers:hd,responseType:responseType||"arraybuffer",timeout:timeout||20000,validateStatus:function(){return true},maxRedirects:5});if(r.status>=400){err=new Error("HTTP "+r.status);continue}return r}catch(e){err=e}}throw err||new Error("fetch failed")}
-async function hshlsFetchSegment(url,headers){try{var q=await hshlsGet(url,Object.assign({},headers,{Range:"bytes=0-0"}),"arraybuffer",10000);if(q.status!==206)return hshlsBuffer(q.data);var cr=String(q.headers&&q.headers["content-range"]||""),m=/\/(\d+)\s*$/.exec(cr),size=m?Number(m[1]):0;if(!size||size<HSHLS_CFG.rangeThreshold)return hshlsBuffer((await hshlsGet(url,headers,"arraybuffer",30000)).data);var part=Math.ceil(size/HSHLS_CFG.rangeParts),jobs=[];for(var i=0;i<HSHLS_CFG.rangeParts;i++){let k=i,a=i*part,b=Math.min(size-1,(i+1)*part-1);jobs.push(hshlsGet(url,Object.assign({},headers,{Range:"bytes="+a+"-"+b}),"arraybuffer",15000).then(function(r){return{k:k,buf:hshlsBuffer(r.data),need:b-a+1}}))}var out=await Promise.all(jobs);out.sort(function(a,b){return a.k-b.k});if(!out.every(function(x){return x.buf.length===x.need}))throw new Error("range parts length mismatch");return Buffer.concat(out.map(function(x){return x.buf}))}catch(e){return hshlsBuffer((await hshlsGet(url,headers,"arraybuffer",30000)).data)}}
+async function hshlsFetchSegment(url,headers){
+  // 普通 HLS 分片直接完整 GET：避免每片先探测 1 字节再建立多路请求。
+  var hd=Object.assign({},headers||{});
+  Object.keys(hd).forEach(function(k){if(k.toLowerCase()==="range"||k.toLowerCase()==="if-range")delete hd[k]});
+  var r=await hshlsGet(url,hd,"arraybuffer",20000);
+  if(r.status!==200)throw new Error("segment HTTP "+r.status);
+  var b=hshlsBuffer(r.data);
+  if(!b.length)throw new Error("empty segment");
+  return b;
+}
 function hshlsNewSession(list,headers){hshlsClean(Date.now());hshlsEvictLRU(HSHLS_CFG.maxSessions);
 var id=require("crypto").randomBytes(8).toString("hex");HSHLS_SESSIONS.set(id,{list:list.slice(),headers:Object.assign({},headers||{}),buf:new Map(),fly:new Map(),at:Date.now()});
 console.log("[HLS-Accel] 🚀 注册加速会话 | sid: "+id.slice(0,8)+" | 总切片数: "+list.length+" | 预取窗口: "+HSHLS_CFG.window+" | 在线会话: "+HSHLS_SESSIONS.size);
 return id}
 function hshlsTrim(s){while(s.buf.size>HSHLS_CFG.maxTsCache)s.buf.delete(s.buf.keys().next().value)}
-function hshlsStart(s,i,isPrefetch){if(s.buf.has(i))return Promise.resolve(s.buf.get(i));if(s.fly.has(i))return s.fly.get(i);var p=hshlsFetchSegment(s.list[i],s.headers).then(function(b){if(!b.length)throw Error("empty segment");s.buf.set(i,b);s.fly.delete(i);hshlsTrim(s);if(isPrefetch)HSHLS_STATS.prefetched++;return b}).catch(function(e){s.fly.delete(i);throw e});s.fly.set(i,p);p.catch(function(){});return p}
-function hshlsPrefetch(s,i){for(var k=i+1;k<=i+HSHLS_CFG.window&&k<s.list.length;k++){if(s.buf.has(k)||s.fly.has(k))continue;if(s.fly.size>=HSHLS_CFG.maxInflightPerSession)break;hshlsStart(s,k,true)}}
+function hshlsStart(s,i,isPrefetch){
+  if(s.buf.has(i))return Promise.resolve(s.buf.get(i));
+  if(s.fly.has(i))return s.fly.get(i);
+  var p=hshlsFetchSegment(s.list[i],s.headers).then(function(b){
+    s.buf.set(i,b);s.fly.delete(i);hshlsTrim(s);
+    if(isPrefetch)HSHLS_STATS.prefetched++;
+    // 完成一个即补一个；只补当前播放位置前方的有界窗口。
+    if(Number.isInteger(s.cursor))hshlsPrefetch(s,s.cursor);
+    return b;
+  }).catch(function(e){
+    s.fly.delete(i);
+    if(!s.prefetchFailed)s.prefetchFailed=new Set();
+    s.prefetchFailed.add(i);
+    // 失败分片不在后台无限重试，播放器真正请求时仍可重试。
+    if(Number.isInteger(s.cursor))hshlsPrefetch(s,s.cursor);
+    throw e;
+  });
+  s.fly.set(i,p);p.catch(function(){});return p;
+}
+function hshlsPrefetch(s,i){
+  s.cursor=i;
+  // 预取数量受缓存容量约束，防止未播放分片被提前淘汰后又重复下载。
+  var keep=Math.max(0,Number(HSHLS_CFG.keepBehind)||0);
+  var window=Math.max(0,Math.min(HSHLS_CFG.window,HSHLS_CFG.maxTsCache-keep-1));
+  for(var k=i+1;k<=i+window&&k<s.list.length;k++){
+    if(s.buf.has(k)||s.fly.has(k)||(s.prefetchFailed&&s.prefetchFailed.has(k)))continue;
+    if(s.fly.size>=HSHLS_CFG.maxInflightPerSession)break;
+    hshlsStart(s,k,true);
+  }
+}
 function hshlsRange(v,len){var m=/^bytes=(\d*)-(\d*)\s*$/.exec(String(v||""));if(!m)return null;var a=m[1]===""?null:Number(m[1]),b=m[2]===""?null:Number(m[2]);if(a==null&&b==null)return null;if(a==null){a=Math.max(0,len-b);b=len-1}else if(b==null||b>=len)b=len-1;return !Number.isFinite(a)||!Number.isFinite(b)||a<0||a>=len||b<a?{bad:true}:{a:a,b:b}}
 async function hshlsSegmentReply(sid,i,range){var s=HSHLS_SESSIONS.get(sid);if(!s||!Number.isInteger(i)||i<0||i>=s.list.length)return{status:404,body:Buffer.from("session expired or invalid index"),headers:{}};s.at=Date.now();
-var buf;if(s.buf.has(i)){HSHLS_STATS.hits++;buf=s.buf.get(i)}else{HSHLS_STATS.misses++;try{buf=await hshlsStart(s,i,false)}catch(e){HSHLS_STATS.fetchErrors++;return{status:502,body:Buffer.from("fetch failed: "+e.message),headers:{}}}}hshlsPrefetch(s,i);
+var buf;if(s.buf.has(i)){HSHLS_STATS.hits++;buf=s.buf.get(i)}else{HSHLS_STATS.misses++;try{var pending=hshlsStart(s,i,false);hshlsPrefetch(s,i);buf=await pending}catch(e){HSHLS_STATS.fetchErrors++;return{status:502,body:Buffer.from("fetch failed: "+e.message),headers:{}}}}hshlsPrefetch(s,i);
 var keep=Number(HSHLS_CFG.keepBehind);if(!Number.isFinite(keep)||keep<0)keep=2;
 [...s.buf.keys()].forEach(function(k){if(k<=i-keep)s.buf.delete(k)});
 var h={"Content-Type":"video/MP2T","Accept-Ranges":"bytes","Access-Control-Allow-Origin":"*","Cache-Control":"public,max-age=60"};if(range){var r=hshlsRange(range,buf.length);if(!r||r.bad)return{status:416,body:Buffer.alloc(0),headers:Object.assign(h,{"Content-Range":"bytes */"+buf.length})};
@@ -2535,7 +2572,7 @@ if(cfg.cleanAds!==false&&/^#EXTM3U/.test(text.replace(/^\s+/,""))){
   text=cl.text;
 }
 var hosts=hshlsHosts(text,url);hshlsAddHosts(sid,hosts);
-var lines=text.replace(/\r\n/g,"\n").split("\n"),segments=[],map=[];for(var i=0;i<lines.length;i++){var l=lines[i].trim();if(!l||l[0]==="#"||hshlsM3u8(l)){map[i]=-1;continue}var u=hshlsUrl(l,url);map[i]=segments.length;segments.push(u)}var isMaster=text.includes("#EXT-X-STREAM-INF")&&segments.length===0;if(!isMaster&&segments.length&&cfg.enabled){var tsid=hshlsNewSession(segments,g.headers);HSHLS_GATEWAYS.set(tsid,{headers:Object.assign({},g.headers),hosts:new Set(hosts),at:Date.now()});lines=lines.map(function(l,i){return map[i]>=0?origin+"/m3u8-ts?sid="+tsid+"&i="+map[i]:l});sid=tsid}else{lines=lines.map(function(l){var v=l.trim();if(!v||v[0]==="#")return l;
+var lines=text.replace(/\r\n/g,"\n").split("\n"),segments=[],map=[];for(var i=0;i<lines.length;i++){var l=lines[i].trim();if(!l||l[0]==="#"||hshlsM3u8(l)){map[i]=-1;continue}var u=hshlsUrl(l,url);map[i]=segments.length;segments.push(u)}var isMaster=text.includes("#EXT-X-STREAM-INF")&&segments.length===0;if(!isMaster&&segments.length&&cfg.enabled){var tsid=hshlsNewSession(segments,g.headers);var warm=HSHLS_SESSIONS.get(tsid);hshlsStart(warm,0,true);hshlsPrefetch(warm,0);HSHLS_GATEWAYS.set(tsid,{headers:Object.assign({},g.headers),hosts:new Set(hosts),at:Date.now()});lines=lines.map(function(l,i){return map[i]>=0?origin+"/m3u8-ts?sid="+tsid+"&i="+map[i]:l});sid=tsid}else{lines=lines.map(function(l){var v=l.trim();if(!v||v[0]==="#")return l;
 var u=hshlsUrl(v,url);if(hshlsM3u8(u)&&depth<4)return origin+"/m3u8-clean?sid="+encodeURIComponent(sid)+"&url="+encodeURIComponent(u);if(u&&!hshlsM3u8(u))return origin+"/m3u8-ts?sid="+encodeURIComponent(sid)+"&url="+encodeURIComponent(u);return l})}return hshlsRewriteKeys(lines.join("\n"),url,sid,origin)}
 function hshlsWrap(url,headers,req,src){if(!hshlsM3u8(url)||hshlsLocal(url)||!/^https?:\/\//i.test(url))return url;var host;try{host=new URL(url).hostname.toLowerCase()}catch(e){return url}if(host==="127.0.0.1"||host==="localhost"||host==="::1"||host==="[::1]"||host==="0.0.0.0")return url;var sid=hshlsGateway(headers,[host]);var out=hshlsOrigin(req)+"/m3u8-clean?sid="+sid+"&url="+encodeURIComponent(url);if(src)out+="&src="+encodeURIComponent(src);return out}
 function hshlsUnwrapLocal(url){try{var u=new URL(String(url||""));var h=u.hostname.toLowerCase();if(h!=="127.0.0.1"&&h!=="localhost"&&h!=="::1"&&h!=="[::1]"&&h!=="0.0.0.0")return null;if(!/\/m3u8$/i.test(u.pathname))return null;var inner=u.searchParams.get("url");if(!inner||!/^https?:\/\//i.test(inner)||hshlsLocal(inner)||!hshlsM3u8(inner))return null;var ih;try{ih=new URL(inner).hostname.toLowerCase()}catch(e){return null}if(ih==="127.0.0.1"||ih==="localhost"||ih==="::1"||ih==="[::1]"||ih==="0.0.0.0")return null;return{url:inner,ref:u.searchParams.get("ref")||u.searchParams.get("referer")||""}}catch(e){return null}}
